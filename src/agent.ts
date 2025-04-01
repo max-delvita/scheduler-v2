@@ -4,7 +4,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { JsonOutputParser } from "@langchain/core/output_parsers";
 import { PromptTemplate } from "@langchain/core/prompts";
 import { Client as PostmarkClient } from "postmark"; // Import Postmark client
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
 
 /**
  * Defines the structure for storing information
@@ -29,6 +29,9 @@ export interface AgentState {
   current_step: string; // e.g., 'start', 'get_organizer_availability', 'get_participant_availability', 'confirming', 'done'
   error_message: string | null; // If something goes wrong
   email_history: BaseMessage[]; // Keep track of the conversation (using LangChain message types)
+
+  // Internal tracking for saving messages
+  last_agent_message_id?: string | null; 
 }
 
 /**
@@ -56,6 +59,7 @@ const workflow = new StateGraph<AgentState>({
             value: (x: BaseMessage[], y: BaseMessage[]) => x.concat(y),
             default: () => [],
         },
+        last_agent_message_id: { value: (x, y) => y ?? x }, // Add channel for new field
     }
 });
 
@@ -67,6 +71,14 @@ const workflow = new StateGraph<AgentState>({
 async function handle_start(state: AgentState): Promise<Partial<AgentState>> {
     console.log("--- Agent Node: handle_start --- ");
 
+    // If we are resuming a session (step is not 'start'), just pass through
+    if (state.current_step && state.current_step !== 'start') {
+        console.log(`Resuming session, skipping initial analysis. Current step: ${state.current_step}`);
+        return {}; // Return no changes, router will handle next step
+    }
+
+    // --- Otherwise, perform initial analysis (existing logic) --- 
+    console.log("Performing initial analysis for new session...");
     const parser = new JsonOutputParser<InitialAnalysis>();
 
     const prompt = PromptTemplate.fromTemplate(
@@ -119,7 +131,7 @@ JSON Output:`
             organizer_email: state.initial_sender_email,
             meeting_topic: analysis.topic,
             participants: analysis.participants,
-            current_step: "get_organizer_availability" // Proceed to next step
+            current_step: "get_organizer_availability" // Ensure this step triggers next action via router
         };
 
     } catch (error) {
@@ -176,21 +188,21 @@ askSymple.ai Scheduling Assistant`;
 
         // Send email via Postmark
         console.log(`Sending availability request to ${state.organizer_email}...`);
-        await postmarkClient.sendEmail({
+        const sendResponse = await postmarkClient.sendEmail({
             From: senderEmailAddress,
             To: state.organizer_email,
             Subject: subject,
             TextBody: fullEmailBody, 
-            // HtmlBody: We could generate HTML too, but TextBody is simpler for now
-            MessageStream: "outbound" // Ensure you have an outbound stream in Postmark
+            MessageStream: "outbound" 
         });
-        console.log("Email sent successfully.");
+        console.log("Email sent successfully. MessageID:", sendResponse.MessageID);
 
         // Update state
-        const sentMessage = new AIMessage({ content: fullEmailBody }); // Represent the email we sent
+        const sentMessage = new AIMessage({ content: fullEmailBody }); 
         return {
             current_step: "awaiting_organizer_response",
-            email_history: [sentMessage] // Add the sent email to history for this step's update
+            email_history: [sentMessage],
+            last_agent_message_id: sendResponse.MessageID // Return the ID
         };
 
     } catch (error) {
@@ -202,42 +214,144 @@ askSymple.ai Scheduling Assistant`;
     }
 }
 
+/**
+ * Processes the organizer's reply email to extract availability.
+ */
+async function process_organizer_response(state: AgentState): Promise<Partial<AgentState>> {
+    console.log("--- Agent Node: process_organizer_response ---");
+
+    // We need the latest email from the organizer
+    // Assuming the webhook handler passes the latest email body
+    // into a specific state field, e.g., `latest_email_body`
+    // For now, let's simulate getting it from history (this needs refinement)
+    const lastMessage = state.email_history[state.email_history.length - 1];
+    if (!lastMessage || !(lastMessage instanceof HumanMessage)) {
+         console.error("Could not find organizer's reply in history.");
+         return { current_step: "error", error_message: "Missing organizer reply." };
+    }
+    const organizerReplyBody = lastMessage.content as string;
+
+    const parser = new JsonOutputParser<{ availability: string[] }>();
+
+    const prompt = PromptTemplate.fromTemplate(
+`You are Amy, an expert meeting scheduling assistant.
+The meeting organizer has replied with their availability for the meeting about "{topic}".
+Analyze their email reply below and extract the specific dates, times, or time ranges they proposed.
+List them as an array of strings.
+
+**CRITICAL**: Respond ONLY with a single, valid JSON object containing ONLY the field "availability" which is an array of strings. EXACTLY as shown in the format instructions. Do not add any other fields or commentary.
+
+Format Instructions:
+{format_instructions}
+
+Organizer's Reply Email Body:
+{reply_body}
+
+JSON Output:`
+    );
+
+    const chain = prompt.pipe(llm).pipe(parser);
+
+    console.log("Analyzing organizer's availability reply...");
+    try {
+        const analysis = await chain.invoke({
+            topic: state.meeting_topic ?? "our meeting",
+            reply_body: organizerReplyBody,
+            format_instructions: parser.getFormatInstructions(),
+        });
+
+        console.log("LLM Availability Analysis Result:", analysis);
+
+        // Decide next step
+        const next_step = state.participants && state.participants.length > 0
+            ? "get_participant_availability" 
+            : "confirm_time"; // If no participants, try to confirm
+
+        return {
+            organizer_availability: analysis.availability,
+            current_step: next_step
+        };
+
+    } catch (error) {
+        console.error("Error analyzing organizer availability:", error);
+        return {
+            current_step: "error",
+            error_message: "Failed to parse organizer availability."
+        };
+    }
+}
+
+/**
+ * Simple router node. It doesn't perform actions, just exists as a state in the graph.
+ * The actual routing logic happens in the conditional edge originating FROM this node.
+ */
+async function route_logic(state: AgentState): Promise<Partial<AgentState>> {
+    console.log(`--- Agent Node: route_logic. Current step: ${state.current_step} ---`);
+    // This node itself doesn't modify the state.
+    // It just needs to return a valid Partial<AgentState>.
+    return {}; 
+}
+
 // --- Graph Construction ---
 
 // Add the nodes to the graph
 workflow.addNode("handle_start", handle_start);
 workflow.addNode("ask_organizer_availability", ask_organizer_availability);
+workflow.addNode("process_organizer_response", process_organizer_response);
+workflow.addNode("route_logic", route_logic);
 
 // Set the entry point
-// @ts-ignore // Suppress potential type mismatch error for node name
+// @ts-ignore
 workflow.setEntryPoint("handle_start");
 
-// Define conditional edges after the initial analysis
+// Always go to the router after the entry point node
+// @ts-ignore
+workflow.addEdge("handle_start", "route_logic");
+
+// The router node conditionally decides where to go next
+// @ts-ignore
 workflow.addConditionalEdges(
-    "handle_start" as any, // Source node - Cast to any to bypass linter issue
-    (state: AgentState) => {
-        // This function decides the next node based on the state
-        console.log(`--- Agent Edge: Routing from handle_start. Current step: ${state.current_step} ---`);
+    "route_logic" as any, // Source node is the router - CAST TO ANY
+    async (state: AgentState) => {
+        // Decision function returns the NAME of the next node or END
+        console.log(`--- Agent Edge: Deciding from route_logic. Current step: ${state.current_step} ---`);
         switch (state.current_step) {
             case "get_organizer_availability":
-                return "ask_organizer_availability"; // Go ask the organizer
+                return "ask_organizer_availability";
+            case "process_organizer_response": 
+                 return "process_organizer_response"; 
+            // --- Add cases for future steps here ---
+            // case "get_participant_availability":
+            //     return "ask_participant_availability";
+            // case "confirm_time":
+            //     return "confirm_time";
+            // case "send_confirmation_email":
+            //     return "send_confirmation_email";
+            // ---------------------------------------
+            case "awaiting_organizer_response": 
+            case "awaiting_participant_response":
             case "error":
             case "end_other_intent":
             default:
-                return END; // Stop if intent wasn't right or an error occurred
+                 console.log(`Routing to END from router due to step: ${state.current_step}`);
+                 return END;
         }
     },
     {
-        // Mapping step names to actual node names
-        "ask_organizer_availability": "ask_organizer_availability" as any, // Cast to any
-        END: END // Ensure END is a valid destination
+        // Mapping the NAMES returned above to the actual nodes
+        "ask_organizer_availability": "ask_organizer_availability" as any,
+        "process_organizer_response": "process_organizer_response" as any,
+        // TODO: Add mappings for future nodes here
+        END: END 
     }
 );
 
-// For now, after asking the organizer, just end the flow.
-// Later, we'll add nodes to handle the organizer's reply.
-// @ts-ignore // Suppress potential type mismatch error for node name
-workflow.addEdge("ask_organizer_availability", END); 
+// After action nodes, always return to the router to decide the next step
+// @ts-ignore
+workflow.addEdge("ask_organizer_availability", "route_logic");
+// @ts-ignore
+workflow.addEdge("process_organizer_response", "route_logic");
+// TODO: Add edges from future action nodes back to route_logic
 
 
 // Compile the graph into a runnable App

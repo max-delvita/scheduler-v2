@@ -12,6 +12,7 @@
   "dependencies": {
     "@langchain/langgraph": "^0.2.62",
     "@langchain/openai": "^0.5.2",
+    "@supabase/supabase-js": "^2.49.4",
     "dotenv": "^16.4.7",
     "elysia": "^1.2.25",
     "langchain": "^0.3.19",
