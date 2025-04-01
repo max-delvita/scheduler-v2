@@ -1,0 +1,20 @@
+{
+  "name": "scheduler-v2",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@langchain/langgraph": "^0.2.62",
+    "@langchain/openai": "^0.5.2",
+    "dotenv": "^16.4.7",
+    "elysia": "^1.2.25",
+    "langchain": "^0.3.19",
+    "postmark": "^4.0.5"
+  }
+}
