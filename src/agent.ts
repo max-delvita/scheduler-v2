@@ -142,34 +142,50 @@ JSON Output:`
             };
         }
 
+        // Filter participants: Remove organizer and agent emails
+        const agentEmail = process.env.POSTMARK_SENDER_EMAIL?.toLowerCase();
+        const finalParticipants = (analysis.participants ?? [])
+            .map(p => p.toLowerCase()) // Normalize to lowercase
+            .filter(p => 
+                p !== state.initial_sender_email?.toLowerCase() && 
+                p !== agentEmail
+            );
+        // Remove duplicates
+        const uniqueParticipants = [...new Set(finalParticipants)];
+        console.log(`Filtered Participants: ${JSON.stringify(uniqueParticipants)}`);
+
         // Determine next step based on analysis
         let next_step: string;
-        let organizer_availability: string[] | null = null;
+        let organizer_availability: string[] | null = analysis.proposed_times?.length ? analysis.proposed_times : null;
+        let times_proposed = !!organizer_availability;
 
-        if (analysis.proposed_times && analysis.proposed_times.length > 0) {
-            console.log("Organizer proposed initial times.");
-            organizer_availability = analysis.proposed_times;
-            // If times proposed, check if we need to ask participants or confirm
-            if (analysis.participants && analysis.participants.length > 0) {
-                next_step = "get_participant_availability";
+        if (uniqueParticipants.length > 0) {
+            // Participants exist
+            if (times_proposed) {
+                console.log("Organizer proposed initial times AND participants exist.");
+                next_step = "get_participant_availability"; // Ask participants about the proposed time
             } else {
-                // No participants, just need to confirm time with organizer? 
-                // Or maybe just finalize if only one time proposed?
-                // Let's go to a confirm step for now.
-                next_step = "confirm_time"; 
+                console.log("Participants exist BUT no initial times proposed.");
+                next_step = "get_participant_availability"; // Ask participants for their availability first
             }
         } else {
-            // No times proposed, need to ask the organizer
-            console.log("No initial times proposed by organizer.");
-            next_step = "get_organizer_availability";
+            // No participants
+            if (times_proposed) {
+                console.log("Organizer proposed initial times, NO participants.");
+                next_step = "confirm_time"; // Confirm the time with the organizer only
+            } else {
+                console.log("NO initial times proposed, NO participants.");
+                next_step = "get_organizer_availability"; // Ask the organizer for time
+            }
         }
+        console.log(`Determined next step: ${next_step}`);
 
         // Update state based on analysis and decided next step
         return {
             organizer_email: state.initial_sender_email,
             meeting_topic: analysis.topic,
-            participants: analysis.participants,
-            organizer_availability: organizer_availability, // Set if proposed
+            participants: uniqueParticipants.length > 0 ? uniqueParticipants : null,
+            organizer_availability: organizer_availability, 
             current_step: next_step 
         };
 
@@ -240,6 +256,7 @@ askSymple.ai Scheduling Assistant`;
             Subject: subject,
             TextBody: fullEmailBody,
             ReplyTo: state._webhook_target_address,
+            Headers: state.last_agent_message_id ? [{ Name: 'References', Value: `<${state.last_agent_message_id}>` }] : undefined,
             MessageStream: "outbound" 
         });
         console.log(`Email sent successfully. MessageID: ${sendResponse.MessageID}. Reply-To set to: ${state._webhook_target_address}`);
@@ -278,15 +295,26 @@ async function process_organizer_response(state: AgentState): Promise<Partial<Ag
     }
     const organizerReplyBody = lastMessage.content as string;
 
-    const parser = new JsonOutputParser<{ availability: string[] }>();
+    // --- Determine if this is a reply to a time proposal ---
+    // We need a way to know if the *previous* step was propose_final_time_to_organizer
+    // This requires better state tracking or inspecting history more carefully.
+    // HACK: Check if participant_availability is filled (means participants replied)
+    const was_proposal_sent = !!state.participant_availability && Object.keys(state.participant_availability).length > 0;
+    console.log(`Was proposal potentially sent? ${was_proposal_sent}`);
+    // --- 
 
+    const parser = new JsonOutputParser<{ availability: string[], accepted_proposal?: boolean | null }>(); // Made accepted optional
     const prompt = PromptTemplate.fromTemplate(
 `You are Amy, an expert meeting scheduling assistant.
-The meeting organizer has replied with their availability for the meeting about "{topic}".
-Analyze their email reply below and extract the specific dates, times, or time ranges they proposed.
-List them as an array of strings.
+The meeting organizer ({organizer_email}) has replied regarding the meeting "{topic}".
+${ was_proposal_sent ? `We previously proposed potential time(s) based on participant feedback (${state.organizer_availability?.join(", ") ?? "previous proposal"}).` : '' }
+Analyze their email reply below. 
+${ was_proposal_sent 
+    ? `Determine: 1. Did they ACCEPT the proposed time? (true/false/null) 2. Did they propose ALTERNATIVE times?` 
+    : `Extract the specific dates, times, or time ranges they proposed for availability.` }
+List any specific times mentioned as an array of strings in the 'availability' field.
 
-**CRITICAL**: Respond ONLY with a single, valid JSON object containing ONLY the field "availability" which is an array of strings. EXACTLY as shown in the format instructions. Do not add any other fields or commentary.
+**CRITICAL**: Respond ONLY with a valid JSON object containing field "availability" (array of strings)${ was_proposal_sent ? ' and optionally "accepted_proposal" (boolean or null)' : ''}. EXACTLY as shown in the format instructions.
 
 Format Instructions:
 {format_instructions}
@@ -302,20 +330,46 @@ JSON Output:`
     console.log("Analyzing organizer's availability reply...");
     try {
         const analysis = await chain.invoke({
+            organizer_email: state.organizer_email ?? "organizer",
             topic: state.meeting_topic ?? "our meeting",
             reply_body: organizerReplyBody,
             format_instructions: parser.getFormatInstructions(),
-        });
-
+            organizer_availability_prompt: state.organizer_availability?.join(", ") ?? "not specified"
+        } as any);
         console.log("LLM Availability Analysis Result:", analysis);
 
-        // Decide next step
-        const next_step = state.participants && state.participants.length > 0
-            ? "get_participant_availability" 
-            : "confirm_time"; // If no participants, try to confirm
+        let next_step: string;
+        let organizer_availability: string[] | null = (analysis.availability && analysis.availability.length > 0) ? analysis.availability : null;
+
+        if (was_proposal_sent) {
+            // Check if organizer accepted the single proposed time
+            const confirmedTime = (organizer_availability && organizer_availability.length === 1) ? organizer_availability[0] : null;
+            if (analysis.accepted_proposal === true && confirmedTime) {
+                console.log("Organizer confirmed the proposed time.");
+                // Overwrite organizer_availability with only the single confirmed time
+                organizer_availability = [confirmedTime]; 
+                next_step = "confirm_time";
+            } else {
+                console.log("Organizer did not confirm or proposed alternatives.");
+                // Use alternatives provided in the reply, or null if none
+                organizer_availability = analysis.availability?.length > 0 ? analysis.availability : null; 
+                next_step = "get_participant_availability"; // Re-check with participants based on new info
+            }
+        } else {
+             // This was the first availability response from organizer
+             if (!organizer_availability) {
+                 console.warn("Organizer replied but provided no availability.");
+                 // TODO: Re-ask organizer?
+                 return { current_step: "awaiting_organizer_response", error_message: "Organizer did not provide availability."};
+             }
+             // Check if we need to ask participants
+             next_step = state.participants && state.participants.length > 0
+                ? "get_participant_availability" 
+                : "confirm_time";
+        }
 
         return {
-            organizer_availability: analysis.availability,
+            organizer_availability: organizer_availability,
             current_step: next_step
         };
 
@@ -396,9 +450,15 @@ Email Body Draft:`
 
         console.log(`STEP 3: Starting loop for participants: ${participants?.join(', ')}`);
         let messagesSentCount = 0;
+        const savePromises: Promise<any>[] = []; // Array to hold save promises
+
         for (const participantEmail of participants!) { 
-            if (participantEmail.toLowerCase() === organizer_email?.toLowerCase()) {
-                console.log(`Skipping participant (is organizer): ${participantEmail}`);
+            const lowerParticipantEmail = participantEmail.toLowerCase();
+            const lowerOrganizerEmail = organizer_email?.toLowerCase();
+            const lowerAgentEmail = agentFromEmail.toLowerCase();
+
+            if (lowerParticipantEmail === lowerOrganizerEmail || lowerParticipantEmail === lowerAgentEmail) {
+                console.log(`Skipping participant (is organizer or agent): ${participantEmail}`);
                 continue;
             }
 
@@ -412,24 +472,37 @@ Email Body Draft:`
                  Subject: subject,
                  TextBody: fullEmailBody,
                  ReplyTo: _webhook_target_address,
+                 Headers: state.last_agent_message_id ? [{ Name: 'References', Value: `<${state.last_agent_message_id}>` }] : undefined,
                  MessageStream: "outbound"
              });
              console.log(`STEP 6: Postmark send complete for ${participantEmail}. MessageID: ${sendResponse.MessageID}`);
 
-             console.log(`STEP 7: Saving sent message details to DB for ${participantEmail}...`);
-             await saveMessage(sessionId, {
+             // Add the save operation promise to the array
+             const messageDetails = {
                 postmark_message_id: sendResponse.MessageID,
                 sender_email: agentFromEmail,
                 recipient_email: participantEmail,
                 subject: subject,
                 body_text: fullEmailBody,
-                in_reply_to_message_id: state.last_agent_message_id, // Was this message prompted by the last agent msg?
+                in_reply_to_message_id: null, // Agent email isn't a direct reply here
                 message_type: 'ai_agent'
-            });
-            console.log(`STEP 8: DB save complete for ${participantEmail}.`);
-            messagesSentCount++;
+             };
+             console.log(`STEP 7: Queueing save operation for message to ${participantEmail} (ID: ${sendResponse.MessageID})`);
+             savePromises.push(saveMessage(sessionId!, messageDetails)); 
+
+             messagesSentCount++;
         }
-        console.log(`STEP 9: Finished loop. Sent ${messagesSentCount} emails.`);
+        console.log(`STEP 9: Finished loop. Sent ${messagesSentCount} emails. Waiting for save operations...`);
+
+        // Wait for all save operations to complete
+        const saveResults = await Promise.allSettled(savePromises);
+        console.log("STEP 10: All save operations settled.");
+        saveResults.forEach((result, index) => {
+            if (result.status === 'rejected') {
+                // Log detailed error if a save failed
+                console.error(`Error saving message at index ${index}:`, result.reason);
+            }
+        });
 
         // Update state
         return {
@@ -486,7 +559,7 @@ A participant ({participant_email}) has replied regarding the meeting "{topic}".
 Organizer proposed: {organizer_availability}
 Analyze their email reply below. Determine:
 1. Did they accept one of the proposed times? (true/false/null)
-2. What specific dates/times/availability did they state?
+2. What specific dates/times/availability did they state? If they accepted a proposed time, list that specific time in the availability array. If they proposed alternatives, list those.
 
 **CRITICAL**: Respond ONLY with a valid JSON object containing fields "availability" (array of strings) and "accepted_proposed" (boolean or null). EXACTLY as shown in the format instructions.
 
@@ -516,19 +589,45 @@ JSON Output:`
         currentParticipantAvailability[participantEmail] = analysis.availability;
 
         // Check if all participants have responded
+        const agentWebhookAddress = state._webhook_target_address?.toLowerCase(); // Use specific address for this session
         const allParticipants = state.participants ?? [];
-        // Exclude organizer if they are in participants list by mistake
-        const targetParticipants = allParticipants.filter(p => p.toLowerCase() !== state.organizer_email?.toLowerCase()); 
+        // Exclude organizer AND agent's webhook address
+        const targetParticipants = allParticipants
+            .map(p => p.toLowerCase())
+            .filter(p => 
+                p !== state.organizer_email?.toLowerCase() && 
+                p !== agentWebhookAddress // Filter using the specific webhook address
+            );
         const respondedParticipants = Object.keys(currentParticipantAvailability);
-        const allResponded = targetParticipants.every(p => respondedParticipants.includes(p));
+        const allResponded = targetParticipants.length > 0 && targetParticipants.every(p => respondedParticipants.includes(p)); // Added check for targetParticipants length > 0
 
+        console.log(`Target Participants: ${targetParticipants.join(', ')}`);
+        console.log(`Responded Participants: ${respondedParticipants.join(', ')}`);
         console.log(`Responded: ${respondedParticipants.length} / ${targetParticipants.length}`);
 
         let next_step: string;
         if (allResponded) {
             console.log("All participants have responded.");
-            // TODO: Add logic to check for conflicts/agreement
-            next_step = "confirm_time"; // Placeholder
+            
+            const organizerProposedTime = (state.organizer_availability && state.organizer_availability.length === 1) ? state.organizer_availability[0] : null;
+            const participantAccepted = analysis.accepted_proposed === true;
+            
+            // --- Simplified Time Match Logic --- 
+            // If organizer proposed a time AND participant accepted, assume it's confirmed for now.
+            if (organizerProposedTime && participantAccepted) {
+                 console.log("Participant accepted organizer's single proposed time (Simplified Check).");
+                 // We need to ensure organizer_availability reflects the accepted time
+                 // If LLM gave us the time, use that. Otherwise, keep organizer's proposed.
+                 state.organizer_availability = (analysis.availability && analysis.availability.length > 0) ? analysis.availability : [organizerProposedTime];
+                 next_step = "confirm_time"; 
+            } else {
+                 console.log("Participant proposed new times or scenario unclear, proposing back to organizer.");
+                 // Store the participant's availability for the proposal
+                 state.participant_availability = state.participant_availability ?? {};
+                 state.participant_availability[participantEmail] = analysis.availability ?? []; // Use actual participant email
+                 next_step = "propose_final_time_to_organizer"; 
+            }
+            // --- End Simplified Time Match ---             
         } else {
             console.log("Still waiting for other participants.");
             next_step = "awaiting_participant_response"; // Stay in waiting state
@@ -544,6 +643,282 @@ JSON Output:`
         return {
             current_step: "error",
             error_message: `Failed to parse participant ${participantEmail} availability.`
+        };
+    }
+}
+
+/**
+ * Checks if a time is agreed upon and prepares for final confirmation.
+ * (Simplified: Assumes agreement if this node is reached).
+ */
+async function confirm_time(state: AgentState): Promise<Partial<AgentState>> {
+    console.log("--- Agent Node: confirm_time ---");
+
+    let agreedTime: string | null = null;
+    if (state.organizer_availability && state.organizer_availability.length === 1 && state.organizer_availability[0]) {
+        agreedTime = state.organizer_availability[0];
+    } else if (state.participant_availability) {
+        const participantEmails = Object.keys(state.participant_availability);
+        for (const email of participantEmails) {
+            const availability = state.participant_availability[email];
+            if (availability && availability.length === 1 && availability[0]) {
+                agreedTime = availability[0];
+                break;
+            }
+        }
+    }
+
+    if (!agreedTime) {
+        console.warn("Could not determine an agreed time in confirm_time node.");
+        // TODO: Handle negotiation if no time found
+        return { current_step: "error", error_message: "Could not determine agreed time."};
+    }
+    
+    console.log(`Time confirmed (simplified logic): ${agreedTime}`);
+    // Ideally, convert agreedTime string to a proper Date object here
+    // state.confirmed_datetime = convertStringToDate(agreedTime);
+
+    return {
+        current_step: "send_confirmation_email",
+        // Store the determined time if needed (e.g., after parsing)
+        // confirmed_datetime: parsedDate 
+    };
+}
+
+/**
+ * Drafts and sends the final confirmation email to all parties.
+ */
+async function send_confirmation_email(state: AgentState, config?: RunnableConfig): Promise<Partial<AgentState>> {
+    console.log("--- Agent Node: send_confirmation_email ---");
+
+    const sessionId = config?.configurable?.thread_id;
+    if (!sessionId) {
+        return { current_step: "error", error_message: "Session ID missing in config." };
+    }
+
+    const { organizer_email, participants, meeting_topic, _webhook_target_address } = state;
+    
+    // --- Determine Agreed Time (Refined Logic Needed) --- 
+    let agreedTime: string | null = null;
+    // PRIORITIZE: Organizer's confirmed time
+    if (state.organizer_availability && state.organizer_availability.length === 1 && state.organizer_availability[0]) {
+        agreedTime = state.organizer_availability[0];
+        console.log(`Confirming using organizer's single availability: ${agreedTime}`);
+    } 
+    // FALLBACK: Participant's confirmed time (less ideal, assumes organizer agreed)
+    else if (state.participant_availability) {
+        console.log("Organizer availability unclear, checking first participant confirmed time...");
+        const participantEmails = Object.keys(state.participant_availability);
+        for (const email of participantEmails) {
+            const availability = state.participant_availability[email];
+            // This assumes the participant node stored the *confirmed* time here
+            if (availability && availability.length === 1 && availability[0]) {
+                agreedTime = availability[0]; 
+                console.log(`Using first participant confirmed time: ${agreedTime}`);
+                break;
+            }
+        }
+    }
+    if (!agreedTime) {
+        console.error("Failed to determine agreed time before sending confirmation.");
+        return { current_step: "error", error_message: "Cannot send confirmation without agreed time." };
+    }
+    // --- End Time Determination ---
+    
+    // --- Prepare Recipient List --- 
+    const allEmails = new Set<string>();
+    if (organizer_email) allEmails.add(organizer_email);
+    (participants ?? []).forEach(p => allEmails.add(p));
+    const finalRecipients = Array.from(allEmails);
+    if (finalRecipients.length === 0) {
+         return { current_step: "error", error_message: "No recipients found for final confirmation." };
+    }
+    // --- End Recipient Prep --- 
+    
+    // Use LLM to draft confirmation body
+    const draftPrompt = PromptTemplate.fromTemplate(
+`You are Amy, an expert meeting scheduling assistant.
+Draft a confirmation email body for a meeting that has been successfully scheduled.
+Topic: {topic}
+Confirmed Time: {agreed_time}
+Participants (will be in To/Cc): {recipients}
+
+Keep it concise and professional. Confirm the details clearly.
+Do not include greetings or closings.
+
+Confirmation Email Body Draft:`
+    );
+    const draftChain = draftPrompt.pipe(llm);
+
+    try {
+        console.log("Drafting confirmation email...");
+        const emailBodyDraftResult = await draftChain.invoke({
+            topic: meeting_topic ?? "Meeting",
+            agreed_time: agreedTime,
+            recipients: finalRecipients.join(', ')
+        });
+        const emailBodyDraft = emailBodyDraftResult.content as string;
+        console.log(`Generated Confirmation Body Draft: ${emailBodyDraft}`);
+
+        const subject = `Meeting Confirmed: ${meeting_topic ?? 'Meeting'} at ${agreedTime}`;
+        const agentFromEmail = process.env.POSTMARK_SENDER_EMAIL ?? "amy@asksymple.ai";
+        const fullEmailBody = `Hi Team,
+
+${emailBodyDraft}
+
+Best regards,
+Amy
+askSymple.ai Scheduling Assistant`;
+
+        // Send email via Postmark to ALL recipients
+        console.log(`Sending confirmation to: ${finalRecipients.join(', ')}`);
+        const sendResponse = await postmarkClient.sendEmail({
+            From: agentFromEmail,
+            To: finalRecipients.join(', '), // Send To all
+            // Bcc: could also BCC recipients if preferred
+            Subject: subject,
+            TextBody: fullEmailBody,
+            Headers: state.last_agent_message_id ? [{ Name: 'References', Value: `<${state.last_agent_message_id}>` }] : undefined,
+            MessageStream: "outbound"
+        });
+        console.log(`Confirmation email sent. MessageID: ${sendResponse.MessageID}`);
+
+        // Update state to final 'done' step
+        return {
+            current_step: "done", 
+            last_agent_message_id: sendResponse.MessageID, // Still return ID for index.ts to save
+            confirmed_datetime: new Date() // Placeholder
+        };
+
+    } catch (error) {
+        console.error("Error sending confirmation email:", error);
+        return {
+            current_step: "error",
+            error_message: `Failed to send confirmation email: ${error instanceof Error ? error.message : String(error)}`
+        };
+    }
+}
+
+/**
+ * Proposes the potential final time back to the organizer for confirmation.
+ */
+async function propose_final_time_to_organizer(state: AgentState, config?: RunnableConfig): Promise<Partial<AgentState>> {
+    console.log("--- Agent Node: propose_final_time_to_organizer ---");
+
+    const sessionId = config?.configurable?.thread_id;
+    if (!sessionId) {
+        return { current_step: "error", error_message: "Session ID missing in config." };
+    }
+
+    const { organizer_email, participants, meeting_topic, _webhook_target_address, participant_availability } = state;
+    if (!organizer_email || !_webhook_target_address) {
+         return { current_step: "error", error_message: "Missing organizer or webhook address." };
+    }
+    
+    // --- Determine Potential Time (Needs Refinement) ---
+    let potentialTime: string | null = null;
+    // PRIORITIZE: If organizer proposed ONE time previously (and we assume participant accepted to reach this node)
+    if (state.organizer_availability && state.organizer_availability.length === 1 && state.organizer_availability[0]) {
+        potentialTime = state.organizer_availability[0];
+        console.log(`Proposing organizer's last single suggestion: ${potentialTime}`);
+    } 
+    // FALLBACK: If organizer availability isn't a single time, check participant response (basic)
+    else if (state.participant_availability) {
+        console.log("Organizer availability unclear, checking first participant response...");
+        const participantEmails = Object.keys(state.participant_availability);
+        for (const email of participantEmails) {
+            const availability = state.participant_availability[email];
+            if (availability && availability.length > 0 && availability[0]) {
+                potentialTime = availability[0]; 
+                console.log(`Using first participant suggestion: ${potentialTime}`);
+                break;
+            }
+        }
+    }
+    // If STILL no time... error
+    if (!potentialTime) {
+        console.error("Failed to determine potential time to propose to organizer.");
+        return { current_step: "error", error_message: "Cannot propose time without availability info." };
+    }
+    // --- End Time Determination ---
+    
+    // Use LLM to draft proposal email body
+    const draftPrompt = PromptTemplate.fromTemplate(
+`You are Amy, an expert meeting scheduling assistant.
+Draft an email body to the meeting organizer ({organizer_email}).
+Regarding the meeting "{topic}".
+The participant(s) ({participants}) have responded.
+A potential time is: {potential_time}
+
+Ask the organizer to confirm if this time works for them.
+Keep it concise and professional. Do not include greetings or closings.
+
+Proposal Email Body Draft:`
+    );
+    const draftChain = draftPrompt.pipe(llm);
+
+    try {
+        console.log("Drafting proposal email to organizer...");
+        const emailBodyDraftResult = await draftChain.invoke({
+            organizer_email: organizer_email,
+            topic: meeting_topic ?? "Meeting",
+            participants: (participants ?? []).join(', '),
+            potential_time: potentialTime
+        });
+        const emailBodyDraft = emailBodyDraftResult.content as string;
+        console.log(`Generated Proposal Body Draft: ${emailBodyDraft}`);
+
+        const subject = `Confirm Time for ${meeting_topic ?? 'Meeting'} with ${participants?.join(', ') ?? 'participants'}?`;
+        const agentFromEmail = process.env.POSTMARK_SENDER_EMAIL ?? "amy@asksymple.ai";
+        const fullEmailBody = `Hi ${state.initial_sender_name ?? 'there'},
+
+${emailBodyDraft}
+
+Please reply to confirm or suggest alternatives.
+
+Best regards,
+Amy
+askSymple.ai Scheduling Assistant`;
+
+        // Send email via Postmark to Organizer
+        console.log(`Sending proposal email to organizer: ${organizer_email}`);
+        const sendResponse = await postmarkClient.sendEmail({
+            From: agentFromEmail,
+            To: organizer_email,
+            Subject: subject,
+            TextBody: fullEmailBody,
+            ReplyTo: _webhook_target_address, // Ensure organizer replies trigger webhook
+            Headers: state.last_agent_message_id ? [{ Name: 'References', Value: `<${state.last_agent_message_id}>` }] : undefined,
+            MessageStream: "outbound"
+        });
+        console.log(`Proposal email sent. MessageID: ${sendResponse.MessageID}`);
+
+        // Ensure saveMessage call is REMOVED/commented out here
+        /*
+        await saveMessage(sessionId, {
+           postmark_message_id: sendResponse.MessageID,
+           sender_email: agentFromEmail,
+           recipient_email: organizer_email, 
+           subject: subject,
+           body_text: fullEmailBody,
+           in_reply_to_message_id: state.last_agent_message_id, // Might need better tracking
+           message_type: 'ai_agent'
+       });
+       */
+
+        // Update state to wait for organizer again
+        return {
+            current_step: "awaiting_organizer_response", 
+            last_agent_message_id: sendResponse.MessageID,
+            // DO NOT clear organizer_availability here - keep the proposed time
+            // organizer_availability: null 
+        };
+
+    } catch (error) {
+        console.error("Error proposing final time to organizer:", error);
+        return {
+            current_step: "error",
+            error_message: `Failed to propose time to organizer: ${error instanceof Error ? error.message : String(error)}`
         };
     }
 }
@@ -577,6 +952,9 @@ workflow.addNode("ask_participant_availability", ask_participant_availability);
 workflow.addNode("process_participant_response", process_participant_response);
 workflow.addNode("route_logic", route_logic);
 workflow.addNode("graph_end", graph_end); // Add the end node
+workflow.addNode("confirm_time", confirm_time);
+workflow.addNode("send_confirmation_email", send_confirmation_email);
+workflow.addNode("propose_final_time_to_organizer", propose_final_time_to_organizer);
 
 // Set the entry point
 // @ts-ignore
@@ -589,9 +967,8 @@ workflow.addEdge("handle_start", "route_logic");
 // The router node conditionally decides where to go next
 // @ts-ignore
 workflow.addConditionalEdges(
-    "route_logic" as any, // Source node is the router
+    "route_logic" as any, 
     async (state: AgentState) => {
-        // Decision function returns the NAME of the next node
         console.log(`--- Agent Edge: Deciding from route_logic. Current step: ${state.current_step} ---`);
         switch (state.current_step) {
             case "get_organizer_availability":
@@ -602,10 +979,18 @@ workflow.addConditionalEdges(
                  return "ask_participant_availability";
             case "process_participant_response":
                  return "process_participant_response";
+            case "confirm_time": // This case should route to the confirm_time node
+                 return "confirm_time";
+            case "send_confirmation_email":
+                 return "send_confirmation_email";
+            case "propose_final_time_to_organizer":
+                 return "propose_final_time_to_organizer";
+            // --- Add cases for future steps here ---
             case "awaiting_organizer_response": 
             case "awaiting_participant_response":
             case "error":
             case "end_other_intent":
+            // case "done": // If we have a done step, it should also go to end
             default:
                  console.log(`Routing to graph_end from router due to step: ${state.current_step}`);
                  return "graph_end"; // Route to explicit end node
@@ -617,7 +1002,10 @@ workflow.addConditionalEdges(
         "process_organizer_response": "process_organizer_response" as any,
         "ask_participant_availability": "ask_participant_availability" as any,
         "process_participant_response": "process_participant_response" as any,
-        "graph_end": "graph_end" as any // Map to the explicit end node
+        "confirm_time": "confirm_time" as any, 
+        "send_confirmation_email": "send_confirmation_email" as any,
+        "propose_final_time_to_organizer": "propose_final_time_to_organizer" as any,
+        "graph_end": "graph_end" as any
     }
 );
 
@@ -630,7 +1018,10 @@ workflow.addEdge("process_organizer_response", "route_logic");
 workflow.addEdge("ask_participant_availability", "route_logic");
 // @ts-ignore
 workflow.addEdge("process_participant_response", "route_logic");
-// TODO: Add edges from future action nodes back to route_logic
+// @ts-ignore
+workflow.addEdge("confirm_time", "route_logic"); // Add edge back from new node
+// @ts-ignore
+workflow.addEdge("send_confirmation_email", "route_logic"); // Add edge back from new node
 
 // Explicit edge from graph_end to the final END state
 // @ts-ignore

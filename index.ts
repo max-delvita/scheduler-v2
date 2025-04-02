@@ -14,22 +14,42 @@ async function findSessionByReply(rawInReplyToId: string | null): Promise<string
   const cleanedMessageId = rawInReplyToId.replace(/[<>]/g, '').trim().split('@')[0];
   if (!cleanedMessageId) return null; // Return null if cleaning resulted in empty string
   
-  console.log(`Cleaned In-Reply-To ID for lookup: ${cleanedMessageId}`); // Log the cleaned ID
+  console.log(`Cleaned In-Reply-To ID for lookup: ${cleanedMessageId}`);
   
   try {
-    const { data, error } = await supabase
+    console.log(`Querying DB: session_messages where postmark_message_id = ${cleanedMessageId}`);
+    const { data, error, status, count } = await supabase
       .from('session_messages')
-      .select('session_id')
-      .eq('postmark_message_id', cleanedMessageId) // Use the properly cleaned ID
-      .limit(1)
-      .single();
+      .select('session_id', { count: 'exact' }) // Request count explicitly
+      .eq('postmark_message_id', cleanedMessageId);
+      // Remove .single() for now to see if multiple rows exist (shouldn't)
+      // .limit(1)
+      // .single();
     
-    if (error && error.code !== 'PGRST116') { // Ignore "Row not found" errors
-      console.error("Error finding session by reply:", error);
+    console.log(`DB Lookup Status: ${status}, Count: ${count}, Data: ${JSON.stringify(data)}, Error: ${JSON.stringify(error)}`);
+
+    if (error) {
+        if (error.code !== 'PGRST116') { 
+             console.error(`DB Error finding session by reply [${cleanedMessageId}]:`, error);
+        } else {
+             console.log(`DB Info: No message found matching reply ID [${cleanedMessageId}].`);
+        }
+        return null; // Return null on any error or no rows found
     }
-    return data?.session_id ?? null;
+
+    if (data && data.length > 0) {
+        if (data.length > 1) {
+            console.warn(`WARN: Found multiple messages (${data.length}) matching reply ID ${cleanedMessageId}. Using first one.`);
+        }
+        console.log(`DB Result for reply lookup [${cleanedMessageId}]: Found SessionID = ${data[0]?.session_id ?? 'null'}`);
+        return data[0]?.session_id ?? null;
+    } else {
+        console.log(`DB Info: Zero rows returned for reply ID [${cleanedMessageId}].`);
+        return null;
+    }
+
   } catch (err) {
-    console.error("Exception finding session by reply:", err);
+    console.error(`Exception finding session by reply [${cleanedMessageId}]:`, err);
     return null;
   }
 }
@@ -193,8 +213,12 @@ app.post('/webhook/email', async ({ body, request }) => { // Access original req
                   loadedState.current_step = "process_organizer_response"; 
                   break;
               case "awaiting_participant_response": 
-                  loadedState.current_step = "process_participant_response"; // Route to participant processor
+                  loadedState.current_step = "process_participant_response"; 
                   break;
+              // Add case for confirm_time? Unlikely reply state, but maybe for errors?
+              // case "confirm_time": 
+              //     loadedState.current_step = "confirm_time"; // Or route to error?
+              //     break;
               default:
                   console.warn(`Reply received for session ${sessionId} in unexpected state: ${loadedState.current_step}. Ignoring reply.`);
                   loadedState = null; // Mark as ignore

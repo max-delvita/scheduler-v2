@@ -19,20 +19,36 @@ console.log("Supabase client initialized (db.ts).");
  */
 export async function saveMessage(sessionId: string, message: Record<string, any>) {
     if (!sessionId) {
-        console.error("Cannot save message without session ID.");
+        console.error("SaveMessage Error: Cannot save message without session ID.");
         return;
     }
-    console.log(`Attempting to save message for session ${sessionId}, type: ${message.message_type}`);
+    const messageIdToSave = message.postmark_message_id;
+    console.log(`Attempting to save message [${messageIdToSave}] for session ${sessionId}, type: ${message.message_type}`);
     try {
-        const { error } = await supabase
+        // Explicitly select columns to ensure we don't pass extra fields
+        const messageData = {
+            session_id: sessionId,
+            postmark_message_id: message.postmark_message_id,
+            sender_email: message.sender_email,
+            recipient_email: message.recipient_email,
+            subject: message.subject,
+            body_text: message.body_text,
+            in_reply_to_message_id: message.in_reply_to_message_id,
+            message_type: message.message_type,
+            // received_at has default value in DB
+        };
+
+        const { data, error } = await supabase
             .from('session_messages')
-            .insert({ session_id: sessionId, ...message });
+            .insert(messageData) // Pass the structured data
+            .select(); // Select the inserted row to confirm
+            
         if (error) {
-            console.error("Error saving message to DB:", error);
+            console.error(`DB Error saving message [${messageIdToSave}] for session ${sessionId}:`, error);
         } else {
-            console.log(`Successfully saved message ID ${message.postmark_message_id} for session ${sessionId}.`)
+            console.log(`Successfully saved message [${messageIdToSave}] for session ${sessionId}. DB returned:`, data); // Log returned data
         }
     } catch (err) {
-        console.error("Exception saving message:", err);
+        console.error(`Exception saving message [${messageIdToSave}] for session ${sessionId}:`, err);
     }
 } 
