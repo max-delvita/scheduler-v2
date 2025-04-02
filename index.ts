@@ -2,31 +2,25 @@ import { Elysia } from 'elysia';
 import 'dotenv/config'; // Load environment variables from .env file
 import { app as agentApp } from './src/agent'; // Import the compiled LangGraph app
 import { HumanMessage, AIMessage, BaseMessage } from '@langchain/core/messages'; // Import message types
-import { createClient } from '@supabase/supabase-js'; // Import Supabase client
+import { supabase, saveMessage as saveMessageToDb } from './src/db'; // Import from db.ts
 import type { AgentState } from './src/agent'; // Use type import
-
-// Initialize Supabase Client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
-
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.error("Supabase URL or Anon Key not found in .env file. Database operations will fail.");
-  // Optionally exit or handle this case more gracefully
-}
-
-const supabase = createClient(supabaseUrl!, supabaseAnonKey!); // Use non-null assertion as we checked above
-console.log("Supabase client initialized.");
 
 // --- Database Helper Functions ---
 
-async function findSessionByReply(messageId: string | null): Promise<string | null> {
-  if (!messageId) return null;
+async function findSessionByReply(rawInReplyToId: string | null): Promise<string | null> {
+  if (!rawInReplyToId) return null;
+  
+  // Clean the ID: Remove <>, trim whitespace, take part before @
+  const cleanedMessageId = rawInReplyToId.replace(/[<>]/g, '').trim().split('@')[0];
+  if (!cleanedMessageId) return null; // Return null if cleaning resulted in empty string
+  
+  console.log(`Cleaned In-Reply-To ID for lookup: ${cleanedMessageId}`); // Log the cleaned ID
+  
   try {
     const { data, error } = await supabase
       .from('session_messages')
       .select('session_id')
-      .eq('postmark_message_id', messageId)
-      // .eq('message_type', 'ai_agent') // Optional: Ensure it replies to an agent msg
+      .eq('postmark_message_id', cleanedMessageId) // Use the properly cleaned ID
       .limit(1)
       .single();
     
@@ -90,6 +84,7 @@ async function getSessionState(sessionId: string): Promise<AgentState | null> {
       current_step: sessionData.current_step,
       error_message: null, // Clear error on load?
       email_history: email_history,
+      _webhook_target_address: sessionData.webhook_target_address
     };
 
     return agentState;
@@ -129,19 +124,6 @@ async function saveSessionState(sessionId: string, state: Partial<AgentState>) {
   }
 }
 
-async function saveMessage(sessionId: string, message: Record<string, any>) {
-    try {
-        const { error } = await supabase
-            .from('session_messages')
-            .insert({ session_id: sessionId, ...message });
-        if (error) {
-            console.error("Error saving message:", error);
-        }
-    } catch (err) {
-        console.error("Exception saving message:", err);
-    }
-}
-
 // --- Elysia Server Setup ---
 
 const app = new Elysia();
@@ -162,13 +144,24 @@ app.post('/webhook/email', async ({ body, request }) => { // Access original req
   // Find In-Reply-To header (case-insensitive)
   const headers = postmarkBody.Headers as {Name: string, Value: string}[];
   const inReplyToHeader = headers?.find(h => h.Name.toLowerCase() === 'in-reply-to');
-  const inReplyToId = inReplyToHeader?.Value?.replace(/[<>]/g, ''); // Clean potential <> wrapping
+  const rawInReplyToValue = inReplyToHeader?.Value;
+
+  // Extract To and Cc email addresses
+  const toEmails = (postmarkBody.ToFull as { Email: string }[] | undefined)
+    ?.map(recipient => recipient.Email)
+    ?? [];
+  const ccEmails = (postmarkBody.CcFull as { Email: string }[] | undefined)
+    ?.map(recipient => recipient.Email)
+    ?? [];
+  const allRecipients = [...toEmails, ...ccEmails];
 
   console.log(`Recipient: ${recipient}`);
   console.log(`Sender: ${senderName} <${senderEmail}>`);
+  console.log(`To: ${toEmails.join(', ')}`);
+  console.log(`Cc: ${ccEmails.join(', ')}`);
   console.log(`Subject: ${subject}`);
   console.log(`Message-ID: ${messageId}`);
-  console.log(`In-Reply-To: ${inReplyToId}`);
+  console.log(`In-Reply-To: ${rawInReplyToValue}`);
   console.log(`Body (Text):\n${textBody?.substring(0, 100)}...`); // Log snippet
 
   // Basic validation
@@ -177,12 +170,18 @@ app.post('/webhook/email', async ({ body, request }) => { // Access original req
     return new Response('Missing data', { status: 400 });
   }
 
-  let sessionId: string | null = null;
-  let loadedState: AgentState | null = null;
+  let sessionId: string | null = null; 
+  let loadedState: AgentState | null = null; // Add loadedState declaration here
+  sessionId = await findSessionByReply(rawInReplyToValue ?? null); 
+  
+  console.log(`Recipient: ${recipient}`);
+  console.log(`Sender: ${senderName} <${senderEmail}>`);
+  console.log(`Subject: ${subject}`);
+  console.log(`Message-ID: ${messageId}`);
+  console.log(`In-Reply-To: ${rawInReplyToValue}`);
+  console.log(`Body (Text):\n${textBody?.substring(0, 100)}...`); // Log snippet
 
   // --- Check if it's a reply --- 
-  sessionId = await findSessionByReply(inReplyToId ?? null);
-  
   if (sessionId) {
       console.log(`Identified as reply to session: ${sessionId}`);
       loadedState = await getSessionState(sessionId);
@@ -193,17 +192,20 @@ app.post('/webhook/email', async ({ body, request }) => { // Access original req
               case "awaiting_organizer_response":
                   loadedState.current_step = "process_organizer_response"; 
                   break;
-              case "awaiting_participant_response": // Placeholder for later
-                  // loadedState.current_step = "process_participant_responses";
-                  console.log("Participant response handling not implemented yet.")
-                  loadedState = null; // Mark as ignore by nulling loadedState
+              case "awaiting_participant_response": 
+                  loadedState.current_step = "process_participant_response"; // Route to participant processor
                   break;
               default:
                   console.warn(`Reply received for session ${sessionId} in unexpected state: ${loadedState.current_step}. Ignoring reply.`);
                   loadedState = null; // Mark as ignore
           }
+          // !!! IMPORTANT HACK FIX NEEDED !!!
+          // Pass the actual sender email into the state so process_participant_response knows who replied
+          if (loadedState) {
+              loadedState.initial_sender_email = senderEmail; // Overwrite initial sender temporarily
+          }
       } else {
-          console.error(`Could not load state for session ${sessionId} found via reply-to ${inReplyToId}. Ignoring.`);
+          console.error(`Could not load state for session ${sessionId} found via reply-to ${rawInReplyToValue}. Ignoring.`);
           sessionId = null; // Reset session ID as state load failed
       }
   } else {
@@ -229,19 +231,32 @@ app.post('/webhook/email', async ({ body, request }) => { // Access original req
       } else {
           // Starting new session
           console.log("Starting new session.");
+          // Filter out the agent's own email from the recipients list
+          const agentEmail = process.env.POSTMARK_SENDER_EMAIL?.toLowerCase();
+          const initialParticipants = allRecipients.filter(
+              email => email.toLowerCase() !== agentEmail
+          );
+          
           initialState = {
               initial_sender_email: senderEmail,
               initial_sender_name: senderName,
               initial_subject: subject,
               initial_body: textBody,
               email_history: [new HumanMessage({ content: textBody })],
-              current_step: 'start'
+              current_step: 'start',
+              _webhook_target_address: recipient,
+              initial_recipients: allRecipients,
+              participants: initialParticipants.length > 0 ? initialParticipants : null
           };
           
           // Create new session in DB *before* invoking agent
           const { data: newSession, error: createError } = await supabase
               .from('scheduling_sessions')
-              .insert({ organizer_email: senderEmail, current_step: 'start' })
+              .insert({
+                 organizer_email: senderEmail, 
+                 current_step: 'start',
+                 webhook_target_address: recipient // Already saving here
+               })
               .select('session_id')
               .single();
               
@@ -254,13 +269,13 @@ app.post('/webhook/email', async ({ body, request }) => { // Access original req
       }
       
       // Save incoming message before invoking agent
-      await saveMessage(currentSessionId!, {
+      await saveMessageToDb(currentSessionId!, {
           postmark_message_id: messageId,
           sender_email: senderEmail,
           recipient_email: recipient,
           subject: subject,
           body_text: textBody,
-          in_reply_to_message_id: inReplyToId,
+          in_reply_to_message_id: rawInReplyToValue,
           message_type: loadedState ? `human_${senderEmail === loadedState.organizer_email ? 'organizer' : 'participant'}` : 'human_organizer' // Determine type
       });
 
@@ -286,13 +301,13 @@ app.post('/webhook/email', async ({ body, request }) => { // Access original req
 
         if (lastAgentMessage) {
             console.log(`Saving agent message with ID: ${finalState.last_agent_message_id}`);
-            await saveMessage(currentSessionId!, {
-                postmark_message_id: finalState.last_agent_message_id, // The ID from Postmark
-                sender_email: process.env.POSTMARK_SENDER_EMAIL ?? "amy@asksymple.ai", // Get from env directly
-                recipient_email: finalState.organizer_email, // Assuming it was sent to organizer
-                subject: `Availability for ${finalState.meeting_topic ?? 'meeting'}`, // Reconstruct or get from state?
+            await saveMessageToDb(currentSessionId!, {
+                postmark_message_id: finalState.last_agent_message_id,
+                sender_email: process.env.POSTMARK_SENDER_EMAIL ?? "amy@asksymple.ai",
+                recipient_email: finalState.organizer_email,
+                subject: `Availability for ${finalState.meeting_topic ?? 'meeting'}`,
                 body_text: lastAgentMessage.content as string,
-                in_reply_to_message_id: messageId, // The AI message is in reply to the triggering human message
+                in_reply_to_message_id: messageId,
                 message_type: 'ai_agent'
             });
         } else {
